@@ -12,9 +12,17 @@ extra_css = ["stylesheets/extra.css"]
 nav = [
   { "Главная" = "index.md" },
   { "Первый запуск" = "start.md" },
+  { "Поддержать проект" = "support/index.md" },
   { "Инструкции" = [
     { "Все инструкции" = "guides/index.md" },
+    # Остальные пункты в русском алфавитном порядке.
+    { "Безопасность VPS" = "guides/security.md" },
     { "Каскад из двух VPS" = "guides/cascade.md" },
+    { "Ключи SSH" = "guides/ssh-keys.md" },
+    { "Личный DNS" = "guides/dns.md" },
+    { "Подключения и nginx" = "guides/connections.md" },
+    { "Резервные копии и клиенты" = "guides/backup.md" },
+    { "Смена доменов" = "guides/domains.md" },
   ] },
 ]
 
