@@ -111,9 +111,45 @@ class CIScope(unittest.TestCase):
         self.assertEqual(summary.strip(), 'DOCS-ONLY: Full Fresh E2E not executed; documentation scope verified.')
         self.assertNotIn('Full Fresh PASS', summary)
 
+    def test_site_markdown_and_png_are_docs_only(self):
+        for name, content in (
+            ('docs-site/index.md', '[Инструкции](guides/index.md)\n'),
+            ('docs-site/guides/index.md', '![Схема](../images/setup.png)\n'),
+            ('docs-site/images/setup.png', png(b'\xff\0\0')),
+        ):
+            self.write(name, content)
+        self.commit()
+        self.assert_mode(self.check(), 'docs-only')
+        self.assert_mode(self.check('push'), 'docs-only')
+
+        for name, content in (
+            ('docs-site/guides/index.md', '# Инструкции\n![Схема](../images/setup.png)\n'),
+            ('docs-site/images/setup.png', png(b'\0\0\0')),
+        ):
+            with self.subTest(name=name):
+                self.base = self.git('rev-parse', 'HEAD')
+                self.write(name, content)
+                self.commit()
+                self.assert_mode(self.check(), 'docs-only')
+
+    def test_site_smoke_rejects_invalid_content(self):
+        for name, content in (
+            ('docs-site/guides/index.md', '[Несуществующая страница](missing.md)\n'),
+            ('docs-site/images/setup.png', b'not a png'),
+        ):
+            with self.subTest(name=name):
+                self.git('reset', '--hard', self.base)
+                self.write(name, content)
+                self.commit()
+                result = self.check()
+                self.assertIn('CI MODE: docs-only', result.stdout)
+                self.assertIn('DOCS SMOKE: FAIL', result.stderr)
+                self.assertEqual(result.returncode, 1)
+
     def test_mixed_and_unknown_files_require_full(self):
         for path in ('x-ui-latest.sh', 'assets/helper.py', 'tests/test_fixture.py',
-                     '.github/workflows/example.yml',
+                     '.github/workflows/example.yml', '.github/workflows/docs-site.yml', 'zensical.toml',
+                     'docs-site/logo.svg', 'docs-site/site.css', 'docs-site/script.js',
                      'SECURITY.md', 'LICENSE', 'unknown.md', 'docs/run.sh', 'docs/data.yaml',
                      'assets/support/logo.svg', 'assets/support/file.bin', 'tests/ci_scope.py'):
             with self.subTest(path=path):
@@ -199,6 +235,88 @@ class CIScope(unittest.TestCase):
         spec = importlib.util.spec_from_file_location('fresh_diagnostics', ROOT/'tests/fresh/diagnostics.py')
         module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
         return module
+
+    def test_ubuntu_image_apt_uses_one_bounded_fallback(self):
+        sources = self.repo/'ubuntu.sources'
+        original = ('Types: deb\nURIs: http://archive.ubuntu.com/ubuntu/\n'
+                    'Suites: noble noble-updates noble-backports\nComponents: main universe\n'
+                    'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n\n'
+                    'Types: deb\nURIs: http://security.ubuntu.com/ubuntu/\n'
+                    'Suites: noble-security\nComponents: main universe\n'
+                    'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n')
+        sources.write_text(original)
+        mirror = 'https://ubuntu.mirrors.ovh.net/ubuntu/'
+        self.write('timeout', '''#!/bin/sh
+case "$1:$2:$3" in -k:5s:1m|-k:5s:90s|-k:5s:2m|-k:5s:3m) ;; *) exit 88 ;; esac
+shift 3
+exec /usr/bin/timeout -k 1s 0.8s "$@"
+''')
+        self.write('apt-get', '''#!/bin/sh
+origin=primary
+if grep -Fq 'https://ubuntu.mirrors.ovh.net/ubuntu/' "$CI_IMAGE_APT_SOURCES"; then
+    origin=mirror
+    cp "$CI_IMAGE_APT_SOURCES" "$trace.sources"
+fi
+case " $* " in
+    *' update '*) operation=update; case " $* " in *' APT::Update::Error-Mode=any '*) ;; *) exit 88 ;; esac ;;
+    *' --download-only '*) operation=fetch ;;
+    *' --no-download '*) operation=install ;;
+    *' download '*) operation=download ;;
+    *) exit 88 ;;
+esac
+printf '%s %s\n' "$origin" "$operation" >> "$trace"
+case "$scenario:$origin:$operation" in
+    slow:primary:update) while :; do printf '.\n'; sleep 0.05; done ;;
+    slow-package:primary:fetch) while :; do printf '.\n'; sleep 0.05; done ;;
+    separate:primary:update|separate:primary:fetch) sleep 0.55 ;;
+    unavailable:primary:update|reuse:primary:update|both:*:update|package:primary:fetch) exit 100 ;;
+    mirror-package:primary:update|mirror-package:mirror:fetch) exit 100 ;;
+    dpkg:primary:install) exit 101 ;;
+esac
+''')
+        for executable in ('timeout', 'apt-get'):
+            (self.repo/executable).chmod(0o755)
+        for scenario, status, calls in (
+            ('healthy', 0, 'primary update,primary fetch,primary install'),
+            ('slow', 0, 'primary update,mirror update,mirror fetch,mirror install'),
+            ('slow-package', 0, 'primary update,primary fetch,mirror update,mirror fetch,mirror install'),
+            ('separate', 0, 'primary update,primary fetch,primary install'),
+            ('unavailable', 0, 'primary update,mirror update,mirror fetch,mirror install'),
+            ('reuse', 0, 'primary update,mirror update,mirror fetch,mirror install,mirror download'),
+            ('package', 0, 'primary update,primary fetch,mirror update,mirror fetch,mirror install'),
+            ('both', 100, 'primary update,mirror update'),
+            ('mirror-package', 100, 'primary update,mirror update,mirror fetch'),
+            ('dpkg', 101, 'primary update,primary fetch,primary install'),
+        ):
+            with self.subTest(scenario=scenario):
+                trace = self.repo/scenario
+                result = subprocess.run(
+                    ['sh', '-ec', '''. "$1"
+check_image() {
+    ci_image_apt_install yes example &&
+        if [ "$scenario" = reuse ]; then ci_image_apt_fetch no download example; fi
+}
+ci_image_apt check_image''',
+                     'sh', str(ROOT/'tests/ci_retry.sh')],
+                    env={**os.environ, 'PATH': str(self.repo)+':'+os.environ['PATH'],
+                         'CI_IMAGE_APT_SOURCES': str(sources), 'scenario': scenario, 'trace': str(trace)},
+                    capture_output=True, text=True, timeout=8,
+                )
+                self.assertEqual(result.returncode, status, result.stdout+result.stderr)
+                self.assertEqual(trace.read_text().splitlines(), calls.split(','))
+                self.assertEqual(sources.read_text(), original)
+                if 'mirror' in calls:
+                    self.assertEqual(trace.with_suffix('.sources').read_text(),
+                        original.replace('http://archive.ubuntu.com/ubuntu/', mirror)
+                                .replace('http://security.ubuntu.com/ubuntu/', mirror))
+                    self.assertIn(mirror, result.stderr)
+                if scenario in ('slow', 'slow-package'):
+                    self.assertIn('exit 124', result.stderr)
+                    self.assertIn('.\n.\n', result.stdout)
+                if scenario in ('both', 'mirror-package'):
+                    operation = 'update' if scenario == 'both' else 'download (install)'
+                    self.assertIn(f'Ubuntu APT {operation} from {mirror} fallback failed (exit 100)',
+                                  result.stderr)
 
     def test_dot_restore_package_diagnostics_publish_only_counts(self):
         diagnostics = self.diagnostics()
