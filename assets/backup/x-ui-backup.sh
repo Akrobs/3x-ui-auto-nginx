@@ -2527,6 +2527,91 @@ recover_restore_target() {
     (( ! failed ))
 }
 
+# Shared with fresh installation via the installed, sourceable Backup helper.
+tune_conntrack() {
+    python3 -I - <<'PYCONNTRACK'
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+from tempfile import NamedTemporaryFile
+
+key = 'net/netfilter/nf_conntrack_max'
+sysctl_key = key.replace('/', '.')
+parameter = Path('/proc/sys') / key
+# Apply the floor after the usual distro and host sysctl drop-ins.
+config = Path('/etc/sysctl.d/zz-3x-ui-conntrack.conf')
+rule = Path('/etc/udev/rules.d/60-3x-ui-conntrack.rules')
+systemd_sysctl = '/usr/lib/systemd/systemd-sysctl'
+marker = '# Managed by 3X-UI AUTO NGINX\n'
+assignment = f'{sysctl_key} = '
+rule_text = marker + ('ACTION=="add", SUBSYSTEM=="module", KERNEL=="nf_conntrack", '
+                      f'RUN+="{systemd_sysctl} --prefix=/{key}"\n')
+
+
+def read_optional(path):
+    try:
+        return path.read_text()
+    except FileNotFoundError:
+        return ''
+
+
+def save(path, text):
+    with NamedTemporaryFile(mode='w', dir=path.parent, delete=False) as temp:
+        temporary = Path(temp.name)
+        try:
+            temp.write(text)
+            temp.flush()
+            os.fchown(temp.fileno(), 0, 0)
+            os.fchmod(temp.fileno(), 0o644)
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def tune():
+    current = int(parameter.read_text())
+    mem = re.search(r'^MemTotal:[ \t]+([1-9][0-9]*)[ \t]+kB$', Path('/proc/meminfo').read_text(), re.M)
+    if not mem:
+        raise ValueError('cannot determine MemTotal in /proc/meminfo')
+    kib = int(mem[1])
+    minimum = 32768 if kib <= 1048576 else 131072 if kib <= 4194304 else 262144
+
+    previous = read_optional(config)
+    if config.is_symlink() or (config.exists() and not re.fullmatch(
+            rf'{re.escape(marker + assignment)}[0-9]+\n', previous)):
+        raise ValueError(f'{config} belongs to the administrator')
+    existing_rule = read_optional(rule)
+    if rule.is_symlink() or (rule.exists() and existing_rule != rule_text):
+        raise ValueError(f'{rule} belongs to the administrator')
+
+    limit = max(current, minimum)
+    if current < limit:
+        subprocess.run(['sysctl', '-q', '-w', f'{sysctl_key}={limit}'], check=True)
+        if int(parameter.read_text()) != limit:
+            raise ValueError(f'{key} did not retain {limit}')
+    if not existing_rule:
+        rule.parent.mkdir(parents=True, exist_ok=True)
+        save(rule, rule_text)
+    try:
+        desired = f'{marker}{assignment}{limit}\n'
+        if previous != desired:
+            save(config, desired)
+    except OSError:
+        if not existing_rule:
+            rule.unlink()
+        raise
+    print(f'[OK] Conntrack: nf_conntrack_max={limit} (minimum {minimum}).')
+
+
+try:
+    tune()
+except (OSError, ValueError, subprocess.CalledProcessError) as error:
+    print(f'[WARN] Conntrack: {error}', file=sys.stderr)
+PYCONNTRACK
+}
+
 cmd_restore() {
     stage 'Restore preflight'
     preflight_target_telemt
@@ -2617,6 +2702,7 @@ cmd_restore() {
     RESTORE_RECOVERY=0 RESTORE_MUTATED=0
     rm -rf -- "$ROLLBACK_DIR"
     ROLLBACK_DIR=''
+    tune_conntrack || warn 'Conntrack: shared tuning helper could not run.'
     printf '\nRestore completed successfully.\n'
     warn 'Recovery uses the saved domains. On a new VPS, point their DNS to this VPS separately.'
     if [[ -n "$RESTORE_DOT_WARNING" ]]; then
