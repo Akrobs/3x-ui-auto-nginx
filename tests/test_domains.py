@@ -21,7 +21,7 @@ import unittest
 from unittest.mock import patch
 
 from certificate_fixtures import function
-from test_personal_xhttp import ROOT, MAIN, SHARED, render, seed
+from test_personal_xhttp import ROOT, MAIN, SHARED, cover_rate_snippets, render, seed
 from test_integrated_features import helper
 
 SOURCE = 'b'*40
@@ -70,6 +70,8 @@ class DomainFixture:
                            ('/etc/nginx/sites-available/'+self.panel, render(MAIN,self.source)),
                            ('/etc/nginx/sites-available/'+self.reality, render('cat > "/etc/nginx/sites-available/${reality_domain}"',self.source))):
             self.write(name, text)
+        if not (legacy or historical):
+            cover_rate_snippets(self.p('/etc/nginx'))
         for name in (self.panel, self.reality, '80.conf'):
             self.p('/etc/nginx/sites-enabled/'+name).symlink_to('/etc/nginx/sites-available/'+name)
         self.write('/etc/nginx/nginx.conf', 'load_module /usr/lib/nginx/modules/ngx_stream_module.so;\n'
@@ -437,7 +439,10 @@ curl() {
                             self.assertIn('if ($host !~* ^'+name.replace('.',r'\.')+'$) { return 404; }',text)
                             self.assertIn('if ($ssl_server_name !~* ^'+name.replace('.',r'\.')+'$) { return 421; }',text)
                     names=f.operation.http_names(f.p(f.module.HTTP).read_text())
-                    self.assertTrue(set(context['domains'][role] for role in ('panel','reality')) <= set(names))
+                    active=[context['domains'][role] for role in ('panel','reality')]
+                    self.assertTrue(set(active) <= set(names))
+                    self.assertTrue({f.panel,f.reality} <= set(names))
+                    if not historical:self.assertEqual(names[:2],active)
                     for table in ('clients','client_inbounds','users','client_traffics'):
                         self.assertEqual(f.state()[table],before[table])
                 files={name:f.p('/etc/nginx/sites-available/'+name).read_bytes()
@@ -860,7 +865,7 @@ curl() {
                                     path.write_text(path.read_text().replace('/etc/letsencrypt/',str(f.p('/etc/letsencrypt'))+'/'))
                             return subprocess.check_output([nginx,*map(str,args[1:])],stderr=subprocess.STDOUT,timeout=15)
                         render_runtime()
-                        validation=runtime/'validation.conf'
+                        validation=config.with_name('validation.conf')
                         validation.write_text(config.read_text().replace(str(pid),str(runtime/'validation.pid')))
                         result=subprocess.check_output([nginx,args[1],'-p',str(runtime)+'/', '-c',str(validation)],stderr=subprocess.STDOUT,timeout=15)
                         return result.replace(str(tree).encode(),b'/etc/nginx')
@@ -1231,6 +1236,9 @@ curl() {
         self.assertTrue(nginx,'Real nginx is required for domain candidate validation')
         f=self.fixture();context=f.operation.discover()
         files,marker=f.operation.file_plan(context,'new.example','new-cover.example',SOURCE)
+        changed_http = next(item for item in files if item['path'] == f.module.HTTP)
+        http = base64.b64decode(changed_http['after']['data']).decode()
+        self.assertEqual(f.operation.http_names(http), ['new.example','new-cover.example',f.panel,f.reality])
         record=dict(format=1,phase='prepared',old=f.operation.summary(context),new={},files=files,database=[],guards={},backup='fixture')
         f.operation.journal(record);f.cert('new.example');f.cert('new-cover.example')
         def real(*args,**kwargs):
