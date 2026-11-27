@@ -945,7 +945,7 @@ render_core_nginx() {
     local stage=$1 name
     local -n inputs=$2
     for name in domain reality_domain sub_path json_path panel_path panel_port sub_port xhttp_path \
-                diag_path diag_token mtr_backend_port ws_port ws_path trojan_port trojan_path INSTALL_WS_GRPC; do
+                diag_path diag_token mtr_backend_port ws_port ws_route trojan_port service_name INSTALL_WS_GRPC; do
         local "$name=${inputs[$name]-}"
     done
     local http2_listen='' http2_on='' ipv6_listen=''
@@ -1071,9 +1071,16 @@ EOF
         grpc_pass unix:/dev/shm/uds2023.sock;
     }
 
-$(if [[ ${INSTALL_WS_GRPC:-n} == y ]]; then cat <<WS_GRPC_NGINX
+$(if [[ ${INSTALL_WS_GRPC:-n} == y ]]; then
+    if [[ $service_name == /* ]]; then
+        grpc_method=${service_name##*/}
+        grpc_route="${service_name%/*}/${grpc_method%%|*}"
+    else
+        grpc_route="/$service_name/Tun"
+    fi
+    cat <<WS_GRPC_NGINX
     # Installer-managed WS: exact path, fixed backend port
-    location = /${ws_port}/${ws_path} {
+    location = ${ws_route} {
         if (\$hack = 1) { return 404; }
         client_max_body_size 0;
         client_body_timeout 1d;
@@ -1091,7 +1098,7 @@ $(if [[ ${INSTALL_WS_GRPC:-n} == y ]]; then cat <<WS_GRPC_NGINX
     }
 
     # Xray custom gRPC serviceName is the full method path (no /Tun suffix)
-    location = /${trojan_port}/${trojan_path} {
+    location = ${grpc_route} {
         if (\$hack = 1) { return 404; }
         client_max_body_size 0;
         client_body_timeout 1d;
@@ -1403,9 +1410,11 @@ configure_nginx() { (
     local stage name
     local -A params=([ipv6]=n)
     for name in domain reality_domain sub_path json_path panel_path panel_port sub_port xhttp_path \
-                diag_path diag_token mtr_backend_port ws_port ws_path trojan_port trojan_path INSTALL_WS_GRPC; do
+                diag_path diag_token mtr_backend_port ws_port trojan_port INSTALL_WS_GRPC; do
         params[$name]=${!name-}
     done
+    params[ws_route]="/${ws_port:-}/$ws_path"
+    params[service_name]="/${trojan_port:-}/$trojan_path|$trojan_path-multi"
     if ipv6_available; then params[ipv6]=y; fi
     params[nginx_version]=$(nginx -v 2>&1 | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' || echo 0)
     stage=$(mktemp -d) || return 1
@@ -1560,10 +1569,11 @@ PY
 }
 
 preflight_panel_release() {
-    bootstrap_panel_dependencies || { msg_err "$(ui_text 'Release preflight dependency setup failed.' 'Не удалось подготовить зависимости для проверки релиза.')"; return 1; }
-    # Curl/CA bootstrap may install base tools; managed state is still untouched.
-    pin_project_source || return 1
-    prepare_backup_helper || return 1
+    if [[ ${1:-} != staged-update ]]; then
+        bootstrap_panel_dependencies || return 1
+        pin_project_source || return 1
+        prepare_backup_helper || return 1
+    fi
     PANEL_STAGE=$(mktemp -d /tmp/x-ui-release.XXXXXX) || return 1
     trap release_panel_preflight EXIT
     chmod 700 "$PANEL_STAGE" || return 1
@@ -1633,16 +1643,17 @@ install_panel_cli() {
 }
 
 install_panel_unit() {
-    cp -f "$1/x-ui.service.debian" /etc/systemd/system/x-ui.service || return 1
-    if grep -qx 'NoNewPrivileges=yes' /etc/systemd/system/x-ui.service &&
-       grep -qx 'ProtectSystem=full' /etc/systemd/system/x-ui.service &&
-       grep -qx 'SystemCallArchitectures=native' /etc/systemd/system/x-ui.service; then
+    local destination=${2:-/etc/systemd/system/x-ui.service}
+    cp -f "$1/x-ui.service.debian" "$destination" || return 1
+    if grep -qx 'NoNewPrivileges=yes' "$destination" &&
+       grep -qx 'ProtectSystem=full' "$destination" &&
+       grep -qx 'SystemCallArchitectures=native' "$destination"; then
         # Supported OSes have systemd >=239. Complete the upstream hardened
         # policy in the owned unit, preserving any upstream seccomp directives.
-        grep -q '^SystemCallErrorNumber=' /etc/systemd/system/x-ui.service ||
-            sed -i '/^\[Service\]$/a SystemCallErrorNumber=EPERM' /etc/systemd/system/x-ui.service || return 1
-        grep -q '^SystemCallFilter=' /etc/systemd/system/x-ui.service ||
-            sed -i '/^\[Service\]$/a SystemCallFilter=@system-service' /etc/systemd/system/x-ui.service || return 1
+        grep -q '^SystemCallErrorNumber=' "$destination" ||
+            sed -i '/^\[Service\]$/a SystemCallErrorNumber=EPERM' "$destination" || return 1
+        grep -q '^SystemCallFilter=' "$destination" ||
+            sed -i '/^\[Service\]$/a SystemCallFilter=@system-service' "$destination" || return 1
     fi
 }
 
@@ -4134,6 +4145,12 @@ no_pending_domain_operation() {
 
 recover_domain_operation() (
     if no_pending_domain_operation; then return 0; fi
+    if [[ -L /var/lib/3x-ui-auto-nginx/update/source ]] &&
+       python3 -I -c 'import json,sys; sys.exit(json.load(open(sys.argv[1])).get("operation") != "update")' /var/lib/3x-ui-auto-nginx/change-domains/journal.json; then
+        [[ ${1:-} != menu ]] || return 0
+        bash /var/lib/3x-ui-auto-nginx/update/source/assets/update/driver.sh recover
+        exit $?
+    fi
     acquire_stack_lock || exit $?
     local DOMAINS_STAGE=''
     trap '[[ -z "$DOMAINS_STAGE" ]] || rm -rf -- "$DOMAINS_STAGE"' EXIT
@@ -4974,14 +4991,79 @@ server_details_action() {
     ui_wrap '2' "$(ui_text '  Passwords are stored in protected form and cannot be shown.' '  Пароли хранятся только в защищённом виде, показать их нельзя.')"
 }
 
+update_action() (
+    (( EUID == 0 )) || { msg_err "$(ui_text 'Run Update as root.' 'Запустите обновление от root.')"; exit 1; }
+    local manifest=/etc/x-ui/auto-nginx-managed.json answer base=/var/lib/3x-ui-auto-nginx stage
+    if ! python3 -I - "$manifest" <<'PYCOMPAT'
+import json, pathlib, sys
+try:
+    state = json.loads(pathlib.Path(sys.argv[1]).read_text())
+    contract = state.get('update_contract')
+    ok = type(contract) is int and contract == 1 and state.get('format') == 1 and state.get('layout') == 'nginx-stream-v1'
+except (ValueError, OSError):
+    ok = False
+sys.exit(0 if ok else 1)
+PYCOMPAT
+    then
+        msg_err "$(ui_text 'In-place Update requires update_contract 1 (3.0+). For 2.x use Backup, Installation and Restore clients and subscriptions.' 'Обновление на месте доступно при update_contract 1 (3.0+). Для 2.x сохраните Backup, выполните Установку и выберите «Восстановить клиентов и подписки».')"
+        exit 1
+    fi
+    ui_title "$(ui_text 'PROJECT UPDATE' 'ОБНОВЛЕНИЕ ПРОЕКТА')"
+    ui_wrap '' "$(ui_text 'Update refreshes managed configuration and preserves panel settings, clients and keys. Managed cover sites may be regenerated. A verified Backup is created before changes. Service may be briefly interrupted and client profiles may need refreshing. Manual edits to managed nginx and transport settings may be replaced.' 'Менеджер обновит конфигурации проекта и сохранит настройки панели, клиентов и ключи. Управляемые сайты-прикрытия могут быть сгенерированы заново. Перед изменениями будет создан и проверен Backup. Возможен краткий перерыв в работе. Может потребоваться обновить клиентские профили. Ручные изменения управляемых конфигураций Nginx и транспортов могут быть заменены.')"
+    ui_text 'Continue? [y/N] ' 'Продолжить? [y/N] '
+    IFS= read -r answer || exit 0
+    [[ $answer == [yY] ]] || exit 0
+    check_os
+    recover_domain_operation || exit $?
+    pin_project_source || exit $?
+    umask 077
+    [[ ! -L $base ]] || exit 1
+    mkdir -p -m 0700 "$base" || exit 1
+    [[ $(stat -c '%u:%g:%a' "$base") == 0:0:700 ]] || exit 1
+    stage=$(mktemp -d "$base/source.XXXXXXXX") || exit 1
+    curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 120 \
+        "https://codeload.github.com/xPROMSx/3x-ui-auto-nginx/tar.gz/$PROJECT_SOURCE_SHA" -o "$stage/source.tar.gz" &&
+        python3 -I - "$stage" "$PROJECT_SOURCE_SHA" <<'PYBUNDLE' || { rm -rf -- "$stage"; exit 1; }
+import pathlib, shutil, sys, tarfile
+dest = pathlib.Path(sys.argv[1])
+prefix = '3x-ui-auto-nginx-'+sys.argv[2]+'/'
+with tarfile.open(dest/'source.tar.gz','r:gz') as tar:
+    for item in tar:
+        if not item.name.startswith(prefix) or not item.isfile():
+            continue
+        name = pathlib.PurePosixPath(item.name[len(prefix):])
+        if name.is_absolute() or '..' in name.parts:
+            raise ValueError('Unsafe project asset path')
+        if name.as_posix() != 'x-ui-latest.sh' and name.parts[:1] != ('assets',):
+            continue
+        path = dest/name
+        path.parent.mkdir(parents=True,exist_ok=True)
+        with path.open('xb') as out:
+            shutil.copyfileobj(tar.extractfile(item),out)
+PYBUNDLE
+    rm -f "$stage/source.tar.gz"
+    local status=0 variable
+    local -a environment=()
+    for variable in https_proxy HTTPS_PROXY http_proxy HTTP_PROXY no_proxy NO_PROXY CURL_CA_BUNDLE; do
+        [[ ! -v $variable ]] || environment+=("--setenv=$variable")
+    done
+    systemd-run "${environment[@]}" --quiet --wait --pipe --collect --unit=xui-in-place-update \
+        --property=OnFailure=xui-update-recover.service --property=UMask=0077 \
+        /bin/bash "$stage/assets/update/driver.sh" worker "$PROJECT_SOURCE_SHA" || status=$?
+    # A disconnected terminal must never remove the worker's recovery code.
+    if [[ ! -e "$base/change-domains/journal.json" && ! -e /etc/systemd/system/xui-update-files.service ]] &&
+       ! systemctl is-active --quiet xui-in-place-update.service; then rm -rf -- "$stage"; fi
+    return "$status"
+)
+
 manager_menu() {
     local choice status=0 reported=0 completion
     UI_INTERACTIVE=1
-    recover_domain_operation || return $?
+    recover_domain_operation menu || return $?
     while true; do
         reported=0
         ui_header "$(ui_text 'MAIN MENU' 'ГЛАВНОЕ МЕНЮ')" 1
-        ui_text '\n  1. Installation\n  2. Change Domains\n  3. Backups\n  4. Telegram Web Proxy Manager\n  5. Cascade\n  6. My server details\n\n' '\n  1. Установка\n  2. Смена доменов\n  3. Резервные копии\n  4. Telegram Web Proxy Manager\n  5. Каскад\n  6. Данные моего сервера\n\n'
+        ui_text '\n  1. Installation\n  2. Change Domains\n  3. Backups\n  4. Telegram Web Proxy Manager\n  5. Cascade\n  6. My server details\n  7. Update\n\n' '\n  1. Установка\n  2. Смена доменов\n  3. Резервные копии\n  4. Telegram Web Proxy Manager\n  5. Каскад\n  6. Данные моего сервера\n  7. Обновление\n\n'
         ui_back "$(ui_text '  0. Exit' '  0. Выход')"
         printf '\n'; ui_prompt
         IFS= read -r choice || return "$status"
@@ -5021,6 +5103,7 @@ manager_menu() {
                     (( status == 0 )) || break
                 done ;;
             4)
+                recover_domain_operation || return $?
                 {
                     completion=$(UI_COMPLETION_FD=3 telegram_manager_action 3>&1 1>&4)
                     status=$?
@@ -5028,6 +5111,7 @@ manager_menu() {
                 if (( status == 0 )) && [[ $completion == completed ]]; then return 0; fi ;;
             5) cascade_menu; status=$?; reported=1 ;;
             6) server_details_action; continue ;;
+            7) update_action; status=$? ;;
             *) ui_text 'Invalid selection.\n' 'Неверный выбор.\n'; continue ;;
         esac
         if (( status )); then

@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from kvm import preflight
 
 from diagnostics import VISION_STAGES, domain_failure, vision_detail, api_restart_metrics, api_restart_nginx_errors
-from diagnostics import dot_restore_package_report, public_service_diagnostics
+from diagnostics import dot_restore_package_report, public_service_diagnostics, update_base_failure
 
 ROOT = Path('/pilot')
 REPO = Path('/repo')
@@ -44,10 +44,34 @@ def failure_location(output):
     # Source locations identify the failed assertion without exposing the
     # exception text, API response, command arguments or raw installer log.
     output = re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', output)
-    frames = re.findall(rb'File "/root/pilot/(checks|install|client|session)\.py", line ([0-9]+)', output)
+    frames = re.findall(rb'File "/root/pilot/(checks|install|client|session|update)\.py", line ([0-9]+)', output)
     if frames:
-        name, line = frames[-1]
+        # A generic command wrapper otherwise hides which recovery probe failed.
+        name, line = next((frame for frame in reversed(frames) if frame[0] == b'update'), frames[-1])
         report['failure_location'] = name.decode()+'.py:'+line.decode()
+
+
+def update_recovery_results(output):
+    results = dict.fromkeys(('candidate', 'nginx', 'start', 'kill'), 'NOT RUN')
+    pattern = rb'^CI Update recovery (candidate|nginx|start|kill): (PASS|FAIL)\r?$'
+    for name, status in re.findall(pattern, output, re.M):
+        results[name.decode()] = status.decode()
+    return results
+
+
+def update_recovery_evidence(output):
+    faults = rb'(candidate|nginx|start|kill)'
+    phases = rb'prepared|draining|switching|start_intent|compare_target|rollback|target_retained|old_ready|verified|committed'
+    frame = rb'(?:managed|database|resources)\.py:[0-9]+'
+    position = rb'[0-9]{1,3}:(?:[0-9]{1,3}|row|schema)'
+    evidence = {}
+    for kind, pattern in ((b'journal', rb'(?:'+phases+rb')'),
+                          (b'trace', frame+rb'(?:,'+frame+rb'){0,5}'),
+                          (b'migration', position+rb'(?:,'+position+rb')*')):
+        prefix = rb'^CI Update '+kind+b' '+faults+rb': ('+pattern+rb')\r?$'
+        for fault, value in re.findall(prefix, output, re.M):
+            evidence.setdefault(fault.decode(), {})[kind.decode()] = value.decode()
+    return evidence
 
 
 def boot():
@@ -56,6 +80,8 @@ def boot():
     kernel = (ROOT/'kernel.path').read_text().strip()
     report['kernel'] = Path(kernel).name
     extra_ssh = ',hostfwd=tcp:127.0.0.1:22221-:2222' if os.environ.get('XUI_RESTORE_ACCEPTANCE') == '1' else ''
+    if (ROOT/'update-base-ref').exists():
+        extra_ssh += ',hostfwd=tcp:127.0.0.1:18443-:443'
     vm = launch(['qemu-system-x86_64', '-accel', 'kvm', '-cpu', 'max', '-m', '4096',
         '-smp', '4', '-nodefaults', '-no-reboot', '-display', 'none', '-serial', 'stdio',
         '-monitor', 'none', '-drive', 'file=/pilot/disk.raw,format=raw,if=virtio',
@@ -99,6 +125,18 @@ def invoke(expression, result_name, timeout=180, tty=False):
     import shlex
     result = ssh('python3 -c '+shlex.quote(code), timeout, tty=tty)
     (ROOT/(phase+'.private.log')).write_bytes(result.stdout+result.stderr)
+    if phase == 'update-failure-and-recovery':
+        cases = update_recovery_results(result.stdout)
+        report['update_recovery'] = cases
+        evidence = update_recovery_evidence(result.stdout)
+        if evidence:
+            report['update_recovery_evidence'] = evidence
+        for name, status in cases.items():
+            print(f'Update recovery {name}: {status}', flush=True)
+    if phase == 'project-update':
+        status = re.search(rb'^CI Update saved profile HTTP: ([1-5][0-9]{2})\r?$', result.stdout, re.M)
+        if status:
+            report['update_saved_profile_http'] = int(status[1])
     diagnostics = ssh('cat /root/pilot/dns-diagnostics.jsonl', 15)
     if diagnostics.returncode == 0:
         probes = [json.loads(line) for line in diagnostics.stdout.splitlines()]
@@ -137,14 +175,16 @@ def invoke(expression, result_name, timeout=180, tty=False):
         raise AssertionError('Guest result unavailable')
     values = json.loads(data.stdout)
     assert isinstance(values, dict) and values and all(v is True for v in values.values())
+    if phase == 'update-failure-and-recovery':
+        assert all(status == 'PASS' for status in cases.values()), 'Update recovery case results incomplete'
     report[phase] = 'PASS'
     report[phase+'_seconds'] = round(time.monotonic()-started, 2)
     print(phase+': PASS', flush=True)
 
 
-def install(scenario, ref):
+def install(scenario, ref, upstream=None):
     import shlex
-    code = 'import sys;sys.path.insert(0,"/root/pilot");import install;install.install('+repr(scenario)+','+repr(ref)+')'
+    code = 'import sys;sys.path.insert(0,"/root/pilot");import install;install.install('+repr(scenario)+','+repr(ref)+','+repr(upstream)+')'
     result = ssh('python3 -c '+shlex.quote(code), 1320)
     (ROOT/(phase+'.private.log')).write_bytes(result.stdout+result.stderr)
     if result.returncode:
@@ -156,7 +196,10 @@ def install(scenario, ref):
         if result.returncode:
             private = ssh('cat /root/pilot/installer.raw.log', 20)
             if private.returncode == 0:
-                detail = vision_detail(private.stdout.decode(errors='replace'), (REPO/'assets/vision/managed.py').read_text())
+                output = private.stdout.decode(errors='replace')
+                if phase == 'install-update-base':
+                    report['update_base_failure'] = update_base_failure(output)
+                detail = vision_detail(output, (REPO/'assets/vision/managed.py').read_text())
                 if detail is not None: report[phase+'_vision_detail'] = detail
             nginx = ssh('tail -n 100 /var/log/nginx/error.log', 20)
             if nginx.returncode == 0:
@@ -189,7 +232,8 @@ def install(scenario, ref):
         assert type(values[key]) in (int, float)
         report[phase+'_'+key] = values[key]
     assert result.returncode == 0 and values['passed'] is True, 'Unexpected real-main result'
-    assert values['installer_sha256'] == hashlib.sha256((REPO/'x-ui-latest.sh').read_bytes()).hexdigest()
+    installer = ROOT/'base-installer' if upstream else REPO/'x-ui-latest.sh'
+    assert values['installer_sha256'] == hashlib.sha256(installer.read_bytes()).hexdigest()
     report[phase] = 'PASS'
     print(phase+': PASS (main exit '+str(values['main_exit'])+', '+str(values['main_seconds'])+'s)', flush=True)
 
@@ -278,6 +322,25 @@ def restore_acceptance(ref):
     poweroff()
 
 
+def external_update_write():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('session', REPO/'assets/amneziawg/managed.py')
+    session = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(session)
+    private = ssh("""cd /root/pilot && python3 -c 'import update,json; print(json.dumps(update.credentials()))'""")
+    private.check_returncode()
+    cred = json.loads(private.stdout)
+    cert = ssh('cat /etc/letsencrypt/live/panel.example.test/fullchain.pem')
+    cert.check_returncode()
+    (ROOT/'update-ca.pem').write_bytes(cert.stdout)
+    panel = session.Panel(cred['url'],cred['username'],cred['password'],ROOT,
+              ['--connect-to','panel.example.test:443:127.0.0.1:18443','--cacert',str(ROOT/'update-ca.pem')])
+    role = ssh("python3 -c \"import json; print(json.load(open('/etc/x-ui/auto-nginx-managed.json'))['inbound_roles']['xhttp'])\"")
+    role.check_returncode()
+    panel.request('panel/api/hosts/add',dict(inboundIds=[int(role.stdout)], remark='external-update-case',
+                                              hosts=['external.example'], port=443, security='same'))
+
+
 def fresh_acceptance(ref, group='all'):
     """Run the linked positive installation, the AGH update scenario and/or the clean-disk negative cases."""
     global phase
@@ -325,12 +388,41 @@ def fresh_acceptance(ref, group='all'):
     if group in ('all','agh'):
         # Needs only an installed system; the phase restores its own state.
         fresh_disk()
-        phase = 'maximum-install'
+        phase = 'install-update-base'
         boot()
-        install('positive', ref)
+        assert ssh('cp /root/pilot/base-installer /root/pilot/x-ui-latest.sh').returncode == 0
+        base = (ROOT/'update-base-ref').read_text().strip()
+        install('positive', base, upstream='v3.10.2')
+        assert ssh('cp /root/pilot/update-source/x-ui-latest.sh /root/pilot/x-ui-latest.sh').returncode == 0
+        phase = 'prepare-update-base-cdn'
+        invoke('__import__("update").prepare_base_cdn()', 'update-base-cdn', 120)
+        phase = 'update-failure-and-recovery'
+        invoke('__import__("update").rollback_cases()', 'update-rollback', 1200)
+        phase = 'interrupted-file-switch'
+        invoke('__import__("update").interrupt_switch()', 'interrupted-update', 600)
+        vm.kill()
+        vm.wait(timeout=30)
+        boot()
+        phase = 'blocked-cold-recovery'
+        invoke('__import__("update").failed_boot()', 'recovery-gated', 180)
+        poweroff()
+        boot()
+        phase = 'update-after-cold-recovery'
+        invoke('__import__("update").verify_cold_recovery()', 'cold-update-recovery', 240)
+        phase = 'project-update'
+        invoke('__import__("update").project_update()', 'update', 1200, tty=True)
         invoke('checks.installed()', 'installed')
+        invoke('checks.transports(positive_only=True, edge_profiles="pre-update-edge-profiles.json")',
+               'updated-transports', 300)
+        phase = 'mtr-start-intent-recovery'
+        invoke('__import__("update").verify_mtr_recovery()', 'updated-mtr', 240)
+        invoke('__import__("update").remove_customer_fixture()', 'end-update-fixture')
         phase = 'native-agh-update'
         invoke('checks.native_agh_update()', 'native-agh-update', 1200, tty=True)
+        phase = 'external-write-before-commit'
+        invoke('__import__("update").await_external()', 'actual-panel-running', 480)
+        external_update_write()
+        invoke('__import__("update").retained()', 'verified-external-write', 180)
         poweroff()
     if group in ('all','negative'):
         phase = 'mandatory-dependency-negative'

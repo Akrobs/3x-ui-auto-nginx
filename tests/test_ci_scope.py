@@ -459,6 +459,105 @@ E: Sub-process /usr/bin/dpkg returned an error code (1)
             self.assertEqual(env['report'].get('failure_location'),'checks.py:527')
             self.assertNotIn(secret,json.dumps(env['report']))
 
+    def test_update_base_diagnostics_do_not_publish_installer_output(self):
+        d = self.diagnostics()
+        private = 'Private installer credentials and paths\n'
+        self.assertEqual(d.update_base_failure(private + 'Stable 3X-UI v3.10.2 is unavailable.\n'
+                         'Release preflight failed; existing deployment was not removed.\n'),
+                         'upstream_release_metadata')
+        self.assertEqual(d.update_base_failure(private +
+                         'Base OS preflight failed; existing deployment was not removed.\n'), 'base_os')
+        self.assertEqual(d.update_base_failure(private + 'Unexpected installer error\n'), 'unknown')
+
+    def test_update_recovery_reports_each_case_and_only_public_locations(self):
+        import ast
+        import contextlib
+        import io
+        import time
+
+        tree = ast.parse((ROOT/'tests/fresh/acceptance.py').read_text())
+        names = {'invoke','failure_location','update_recovery_results','update_recovery_evidence'}
+        functions = [node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name in names]
+        secret = 'PRIVATE-SESSION-https://secret.invalid/token'
+        guest = (
+            'CI Update recovery candidate: PASS\n'
+            'CI Update recovery nginx: FAIL\n'
+            'CI Update journal nginx: old_ready\n'
+            'CI Update trace nginx: managed.py:423,managed.py:392,resources.py:40\n'
+            'CI Update migration nginx: 7:4,7:5,8:row,9:schema\n'
+            'CI Update migration start: 7:4,'+secret+'\n'
+            'CI Update trace start: '+secret+'\n'
+            'CI Update journal start: '+secret+'\n'
+            'CI Update recovery start: '+secret+'\n'
+            'CI Update recovery '+secret+': PASS\n'
+            '  File "/root/pilot/update.py", line 198, in rollback_cases\n'
+            '  File "/root/pilot/checks.py", line 31, in run\n'
+            'ValueError: '+secret+'\n'
+        ).encode()
+        def ssh(command,*args,**kwargs):
+            return subprocess.CompletedProcess([],1,guest if command.startswith('python3 -c') else b'',b'')
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()) as output:
+            env = dict(ROOT=Path(directory),phase='update-failure-and-recovery',report={},ssh=ssh,re=re,time=time)
+            exec(compile(ast.Module(body=functions,type_ignores=[]),'acceptance.py','exec'),env)
+            with self.assertRaises(AssertionError):
+                env['invoke']('update.rollback_cases()','update-rollback')
+        self.assertEqual(env['report'],{
+            'failure_location':'update.py:198',
+            'update_recovery':{'candidate':'PASS','nginx':'FAIL','start':'NOT RUN','kill':'NOT RUN'},
+            'update_recovery_evidence':{'nginx':{'journal':'old_ready',
+                                              'migration':'7:4,7:5,8:row,9:schema',
+                                              'trace':'managed.py:423,managed.py:392,resources.py:40'}},
+        })
+        self.assertIn('Update recovery candidate: PASS',output.getvalue())
+        self.assertIn('Update recovery nginx: FAIL',output.getvalue())
+        self.assertIn('Update recovery start: NOT RUN',output.getvalue())
+        self.assertIn('Update recovery kill: NOT RUN',output.getvalue())
+        self.assertNotIn(secret,output.getvalue())
+
+    def test_update_nginx_fault_only_fires_during_apply(self):
+        import ast
+        from types import SimpleNamespace
+
+        tree = ast.parse((ROOT/'tests/fresh/update.py').read_text())
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                        and node.name == 'inject_nginx_fault')
+        env = {'LIMIT': self.repo/'nginx.conf'}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), 'update.py', 'exec'), env)
+        touched = self.repo/'fault'
+        journal = {'phase':'old_ready'}
+        worker = SimpleNamespace(record=lambda: journal)
+        self.write('nginx.conf', 'restored\n')
+        env['inject_nginx_fault'](worker, touched)
+        self.assertFalse(touched.exists())
+        self.assertEqual(env['LIMIT'].read_text(), 'restored\n')
+        journal['phase'] = 'switching'
+        env['inject_nginx_fault'](worker, touched)
+        self.assertTrue(touched.exists())
+        self.assertEqual(env['LIMIT'].read_text(), 'invalid_directive;\n')
+
+    def test_update_migration_reports_all_changed_positions(self):
+        import ast
+        import sqlite3
+        from contextlib import closing
+
+        tree = ast.parse((ROOT/'tests/fresh/update.py').read_text())
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                        and node.name == 'migration_differences')
+        env = {'sqlite3': sqlite3}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), 'update.py', 'exec'), env)
+        before = self.repo/'before.db'
+        with closing(sqlite3.connect(before)) as source, closing(sqlite3.connect(':memory:', uri=True)) as target:
+            source.executescript(
+                "CREATE TABLE a(id INTEGER PRIMARY KEY, x TEXT, y TEXT);"
+                "INSERT INTO a VALUES(1,'private','secret');"
+                "CREATE TABLE b(id INTEGER PRIMARY KEY, x TEXT);"
+                "INSERT INTO b VALUES(1,'private'),(2,'secret');"
+            )
+            source.backup(target)
+            target.executescript("UPDATE a SET x='', y=''; DELETE FROM b WHERE id=1; UPDATE b SET x='';")
+            self.assertEqual(list(env['migration_differences'](target, before)),
+                             ['0:1', '0:2', '1:row', '1:1'])
+
     def test_service_diagnostics_publish_only_unit_states_and_ports(self):
         from unittest.mock import patch
         diagnostics = self.diagnostics()
@@ -530,16 +629,25 @@ E: Sub-process /usr/bin/dpkg returned an error code (1)
         functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
         positive=['maximum-install','manager-backup','transport-consumers','AWG-payload','tech0-RED-GREEN',
                   'installed-renewal-hooks','cold-boot','cold-transport-consumers','change-domains','restore-before-domains']
-        agh=['maximum-install','maximum-install','native-agh-update']
+        agh=['install-update-base','prepare-update-base-cdn','update-failure-and-recovery',
+             'interrupted-file-switch','blocked-cold-recovery','update-after-cold-recovery',
+             'project-update','project-update','project-update','mtr-start-intent-recovery',
+             'mtr-start-intent-recovery','native-agh-update',
+             'external-write-before-commit','external-write-before-commit']
         negative=['mandatory-dependency-negative','DoT-outage-partial-install','DoT-outage-core-consumers']
         with tempfile.TemporaryDirectory() as directory:
             for group,disks in (('all',6),('positive',3),('agh',1),('negative',2)):
                 events=[];calls=[];group_root=Path(directory)/group;group_root.mkdir()
                 env=dict(ROOT=group_root,phase='',re=re)
                 def record(kind):events.append((kind,env['phase']))
+                if group in ('all','agh'):
+                    (group_root/'update-base-ref').write_text('b'*40+'\n')
+                installs=[]
                 env.update(fresh_disk=lambda:record('disk'),boot=lambda:record('boot'),poweroff=lambda:record('off'),
-                    install=lambda scenario,*args:(record('phase'),calls.append(scenario)),
+                    install=lambda scenario,*args,**kwargs:(record('phase'),calls.append(scenario),installs.append((scenario,args,kwargs))),
                     invoke=lambda expression,*args,**kwargs:(record('phase'),calls.append(expression)),
+                    external_update_write=lambda:record('external-write'),
+                    vm=SimpleNamespace(kill=lambda:record('kill'),wait=lambda **kwargs:record('wait')),
                     ssh=lambda *args,**kwargs:SimpleNamespace(returncode=0,stdout=b'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n'))
                 exec(compile(ast.Module(body=functions,type_ignores=[]),'acceptance.py','exec'),env)
                 env['fresh_acceptance']('a'*40,group)
@@ -555,7 +663,14 @@ E: Sub-process /usr/bin/dpkg returned an error code (1)
                     'checks.installed(cold=True)','checks.transports()','checks.change_domains()',
                     'checks.restore_before_domains()','dot-restore-source','checks.restore_source(dot=True)',
                     'checks.restore_dot_target()','checks.change_dot_panel()']
-                agh_calls=['positive','checks.installed()','checks.native_agh_update()']
+                agh_calls=['positive','__import__("update").prepare_base_cdn()',
+                    '__import__("update").rollback_cases()','__import__("update").interrupt_switch()',
+                    '__import__("update").failed_boot()','__import__("update").verify_cold_recovery()',
+                    '__import__("update").project_update()','checks.installed()',
+                    'checks.transports(positive_only=True, edge_profiles="pre-update-edge-profiles.json")',
+                    '__import__("update").verify_mtr_recovery()',
+                    '__import__("update").remove_customer_fixture()','checks.native_agh_update()',
+                    '__import__("update").await_external()','__import__("update").retained()']
                 negative_calls=['dependency','dot-outage','checks.transports(vision=False, ws_grpc=False)']
                 self.assertEqual(calls,(positive_calls if group in ('all','positive') else [])+
                                        (agh_calls if group in ('all','agh') else [])+
@@ -565,7 +680,10 @@ E: Sub-process /usr/bin/dpkg returned an error code (1)
                     self.assertEqual([phase for kind,phase in events if kind=='phase'].count('native-agh-update'),1)
                 self.assertEqual(sum(kind=='disk' for kind,_ in events),disks)
                 if group=='agh':
-                    self.assertEqual([kind for kind,_ in events],['disk','boot','phase','phase','phase','off'])
+                    self.assertEqual(installs,[('positive',('b'*40,),{'upstream':'v3.10.2'})])
+                    self.assertEqual([kind for kind,_ in events],
+                        ['disk','boot','phase','phase','phase','phase','kill','wait','boot','phase','off',
+                         'boot','phase','phase','phase','phase','phase','phase','phase','phase','external-write','phase','off'])
                 if group in ('all','negative'):
                     for phase in negative[:2]:
                         boot_index=events.index(('boot',phase))
@@ -584,6 +702,34 @@ E: Sub-process /usr/bin/dpkg returned an error code (1)
         restore=next(node for node in ast.walk(main) if isinstance(node,ast.If) and 'XUI_RESTORE_ACCEPTANCE' in ast.unparse(node.test))
         self.assertEqual(ast.unparse(restore.body[0]),'restore_acceptance(ref)')
         self.assertNotIn('fresh_acceptance',ast.unparse(ast.Module(body=restore.body,type_ignores=[])))
+
+    def test_update_base_answers_match_historical_installer(self):
+        import ast
+        tree = ast.parse((ROOT/'tests/fresh/install.py').read_text())
+        answers = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name=='install_answers')
+        env = {}
+        exec(compile(ast.Module(body=[answers],type_ignores=[]), 'install.py', 'exec'), env)
+        script = r"""
+source "$1"
+PANEL_VERSION=$2
+select_security && select_additional_connections && select_warp_ru && select_adguard && select_dot && select_client || exit 1
+if read -r extra; then exit 1; fi
+printf 'OPTIONS %s %s %s %s %s %s %s %s %s\n' "$INSTALL_SECURITY" "$INSTALL_WS_GRPC" "$INSTALL_VISION" "$INSTALL_AWG" \
+    "$INSTALL_XHTTP_CDN" "$INSTALL_WARP_RU" "$INSTALL_AGH" "$INSTALL_AGH_DOT" "$CREATE_CLIENT"
+if [[ -n $PANEL_VERSION ]]; then
+    PANEL_TAG=$PANEL_VERSION
+    INSTALL_XHTTP_CDN=y
+    preflight_xhttp_cdn && exit 1
+fi
+exit 0
+"""
+        for upstream, expected in ((None, b'y y y y y n y n y'), ('v3.10.2', b'y y y y n n y n y')):
+            with self.subTest(upstream=upstream):
+                proc = subprocess.run(['bash','-c',script,'fixture',ROOT/'x-ui-latest.sh',upstream or ''],
+                    input=env['install_answers']('positive',upstream),capture_output=True,timeout=15,check=True)
+                self.assertIn(b'OPTIONS '+expected+b'\n',proc.stdout)
+                if upstream:
+                    self.assertIn(b'XHTTP CDN requires the verified 3X-UI baseline',proc.stdout)
 
     def test_fresh_final_check_fails_closed_for_all_job_results(self):
         import ast,itertools,textwrap
